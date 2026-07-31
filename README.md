@@ -2,6 +2,8 @@
 
 一个使用 **Python + tkinter/ttk** 编写的轻量桌面工具，用于可视化管理 Pi Coding Agent 的 `~/.pi/agent/models.json`。无需手动编辑 JSON，即可维护 Provider、模型、备份和配置方案。
 
+社区：https://linux.do
+
 ## 功能
 
 - Provider 新增、编辑、删除：`baseUrl`、`api`、API Key、`headers`、`compat`
@@ -132,3 +134,7 @@ pyinstaller --noconfirm --onefile --windowed --name PiProviderManager main.py
 ```
 
 输出的可执行文件位于 `dist/`。程序所有路径均使用 `os.path.expanduser`，在打包运行时仍会使用当前用户目录下的 Pi 配置和数据库。
+
+## 许可证
+
+MIT
