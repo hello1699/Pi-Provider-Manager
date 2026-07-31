@@ -83,7 +83,14 @@ python main.py
           "reasoning": true,
           "input": ["text", "image"],
           "contextWindow": 128000,
-          "maxTokens": 8192
+          "maxTokens": 8192,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "max": "max"
+          }
         }
       ]
     }
@@ -91,7 +98,9 @@ python main.py
 }
 ```
 
-对于 Cost：四个字段 `input`、`output`、`cacheRead`、`cacheWrite` 要么全部留空（不写入配置），要么全部填写非负整数。
+对于 Cost：四个字段 `input`、`output`、`cacheRead`、`cacheWrite` 要么全部留空（不写入配置），要么全部填写非负数字（支持小数）。
+
+`thinkingLevelMap` 用于将 Pi 的 `minimal`、`low`、`medium`、`high`、`max` 五种思考强度映射为 Provider 支持的字符串。在模型窗口中五项均可选：未填写时会保存为 `null`，填写时会保存为对应字符串。
 
 ## 获取模型列表
 

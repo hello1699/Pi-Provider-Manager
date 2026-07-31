@@ -9,7 +9,13 @@ from unittest.mock import Mock, patch
 
 from config_manager import ConfigManager
 from database import Database, format_backup_time_local
-from utils import ValidationError, build_models_url, fetch_provider_models, parse_json_object
+from utils import (
+    ValidationError,
+    build_models_url,
+    fetch_provider_models,
+    parse_json_object,
+    validate_nonnegative_number,
+)
 
 
 class ConfigManagerTests(unittest.TestCase):
@@ -77,6 +83,38 @@ class ConfigManagerTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.manager.replace_config({"providers": []})
 
+    def test_thinking_level_map_persists_and_can_be_replaced(self):
+        self.manager.add_provider("example", self.provider())
+        model = self.model()
+        model["thinkingLevelMap"] = {
+            "minimal": None,
+            "low": None,
+            "medium": None,
+            "high": "high",
+            "max": "max",
+        }
+        self.manager.add_model("example", model)
+        self.assertEqual(model["thinkingLevelMap"], self.manager.config["providers"]["example"]["models"][0]["thinkingLevelMap"])
+        with open(self.config_path, encoding="utf-8") as config_file:
+            self.assertEqual(
+                model["thinkingLevelMap"],
+                json.load(config_file)["providers"]["example"]["models"][0]["thinkingLevelMap"],
+            )
+
+        updated = self.model()
+        updated["thinkingLevelMap"] = {
+            "minimal": "minimal",
+            "low": None,
+            "medium": "medium",
+            "high": None,
+            "max": None,
+        }
+        self.manager.update_model("example", "test-model", updated)
+        self.assertEqual(
+            updated["thinkingLevelMap"],
+            self.manager.config["providers"]["example"]["models"][0]["thinkingLevelMap"],
+        )
+
 
 class DatabaseTests(unittest.TestCase):
     def setUp(self):
@@ -128,6 +166,14 @@ class UtilsTests(unittest.TestCase):
         self.assertEqual({"X-Test": "yes"}, parse_json_object('{"X-Test": "yes"}', "Headers"))
         with self.assertRaises(ValidationError):
             parse_json_object("[]", "Headers")
+
+    def test_cost_accepts_nonnegative_decimals(self):
+        self.assertEqual(0.000003, validate_nonnegative_number("0.000003", "Cost.input"))
+        self.assertEqual(0.0, validate_nonnegative_number("0", "Cost.output"))
+        with self.assertRaises(ValidationError):
+            validate_nonnegative_number("-0.01", "Cost.input")
+        with self.assertRaises(ValidationError):
+            validate_nonnegative_number("not-a-number", "Cost.input")
 
     @patch("utils.requests.get")
     def test_fetch_models_sends_auth_headers_and_normalizes_ids(self, mocked_get):

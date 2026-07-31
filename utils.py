@@ -41,6 +41,17 @@ def validate_positive_int(value, field_name, allow_zero=False):
     return number
 
 
+def validate_nonnegative_number(value, field_name):
+    """Parse a nonnegative JSON-compatible number, including decimal prices."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValidationError("%s 必须是数字。" % field_name) from error
+    if number < 0:
+        raise ValidationError("%s 不能为负数。" % field_name)
+    return number
+
+
 def build_models_url(base_url):
     """Build Pi-compatible provider health endpoint from a base API URL."""
     base_url = validate_url(base_url)

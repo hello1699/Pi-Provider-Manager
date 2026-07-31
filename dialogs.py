@@ -4,7 +4,13 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from database import format_backup_time_local
-from utils import ValidationError, parse_json_object, validate_positive_int, validate_url
+from utils import (
+    ValidationError,
+    parse_json_object,
+    validate_nonnegative_number,
+    validate_positive_int,
+    validate_url,
+)
 
 
 class ProviderDialog(tk.Toplevel):
@@ -89,6 +95,7 @@ class ProviderDialog(tk.Toplevel):
 
 class ModelDialog(tk.Toplevel):
     COST_FIELDS = ("input", "output", "cacheRead", "cacheWrite")
+    THINKING_LEVEL_FIELDS = ("minimal", "low", "medium", "high", "max")
 
     def __init__(self, parent, model=None, on_save=None, on_cancel=None):
         super().__init__(parent)
@@ -100,6 +107,11 @@ class ModelDialog(tk.Toplevel):
         self.on_cancel = on_cancel
         model = model or {}
         cost = model.get("cost", {}) if isinstance(model.get("cost", {}), dict) else {}
+        thinking_level_map = (
+            model.get("thinkingLevelMap", {})
+            if isinstance(model.get("thinkingLevelMap", {}), dict)
+            else {}
+        )
 
         self.id_var = tk.StringVar(value=model.get("id", ""))
         self.context_var = tk.StringVar(value=str(model.get("contextWindow", "")))
@@ -109,6 +121,12 @@ class ModelDialog(tk.Toplevel):
         self.text_var = tk.BooleanVar(value="text" in inputs)
         self.image_var = tk.BooleanVar(value="image" in inputs)
         self.cost_vars = {key: tk.StringVar(value=str(cost.get(key, ""))) for key in self.COST_FIELDS}
+        self.thinking_level_vars = {
+            key: tk.StringVar(
+                value=thinking_level_map[key] if isinstance(thinking_level_map.get(key), str) else ""
+            )
+            for key in self.THINKING_LEVEL_FIELDS
+        }
 
         form = ttk.Frame(self, padding=12)
         form.grid(sticky="nsew")
@@ -126,8 +144,14 @@ class ModelDialog(tk.Toplevel):
         ttk.Label(form, text="Cost（可选，全部填写或全部留空）").grid(row=6, column=0, columnspan=2, sticky="w")
         for row, key in enumerate(self.COST_FIELDS, start=7):
             self._entry(form, row, key, self.cost_vars[key])
+        ttk.Separator(form).grid(row=11, column=0, columnspan=2, sticky="ew", pady=8)
+        ttk.Label(form, text="Thinking Level Map（空白写入 null）").grid(
+            row=12, column=0, columnspan=2, sticky="w"
+        )
+        for row, key in enumerate(self.THINKING_LEVEL_FIELDS, start=13):
+            self._entry(form, row, key, self.thinking_level_vars[key])
         buttons = ttk.Frame(form)
-        buttons.grid(row=11, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        buttons.grid(row=18, column=0, columnspan=2, sticky="e", pady=(12, 0))
         ttk.Button(buttons, text="取消", command=self._cancel).pack(side="right")
         ttk.Button(buttons, text="保存", command=self._save).pack(side="right", padx=(0, 8))
         self.protocol("WM_DELETE_WINDOW", self._cancel)
@@ -167,9 +191,13 @@ class ModelDialog(tk.Toplevel):
             }
             if filled:
                 model["cost"] = {
-                    key: validate_positive_int(value, "Cost.%s" % key, allow_zero=True)
+                    key: validate_nonnegative_number(value, "Cost.%s" % key)
                     for key, value in values.items()
                 }
+            model["thinkingLevelMap"] = {
+                key: self.thinking_level_vars[key].get().strip() or None
+                for key in self.THINKING_LEVEL_FIELDS
+            }
             self.on_save(model)
             self.destroy()
         except (ValidationError, ValueError) as error:
