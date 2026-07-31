@@ -10,10 +10,12 @@ from unittest.mock import Mock, patch
 from config_manager import ConfigManager
 from database import Database, format_backup_time_local
 from utils import (
+    ModelListCache,
     ValidationError,
     build_models_url,
     fetch_provider_models,
     parse_json_object,
+    provider_model_list_cache_key,
     validate_nonnegative_number,
 )
 
@@ -115,6 +117,43 @@ class ConfigManagerTests(unittest.TestCase):
             self.manager.config["providers"]["example"]["models"][0]["thinkingLevelMap"],
         )
 
+    def test_pause_and_resume_model_preserves_full_definition(self):
+        self.manager.add_provider("example", self.provider())
+        model = self.model()
+        model["cost"] = {"input": 0.1, "output": 0.2, "cacheRead": 0.01, "cacheWrite": 0.02}
+        model["thinkingLevelMap"] = {"minimal": None, "low": None, "medium": None, "high": "high", "max": "max"}
+        self.manager.add_model("example", model)
+
+        self.manager.pause_model("example", "test-model", "workspace")
+        self.assertEqual([], self.manager.config["providers"]["example"]["models"])
+        with open(self.config_path, encoding="utf-8") as config_file:
+            self.assertEqual([], json.load(config_file)["providers"]["example"]["models"])
+        paused_models = self.db.list_paused_models("workspace", "example")
+        self.assertEqual(1, len(paused_models))
+        self.assertEqual("test-model", paused_models[0][0])
+
+        restarted_database = Database(os.path.join(self.temp_dir.name, "test.db"))
+        restarted_manager = ConfigManager(restarted_database, self.config_path)
+        restarted_manager.resume_model("example", "test-model", "workspace")
+        self.assertEqual(model, restarted_manager.config["providers"]["example"]["models"][0])
+        self.assertEqual([], restarted_database.list_paused_models("workspace", "example"))
+
+    def test_resume_duplicate_keeps_paused_model(self):
+        self.manager.add_provider("example", self.provider())
+        self.manager.add_model("example", self.model())
+        self.manager.pause_model("example", "test-model", "workspace")
+        self.manager.add_model("example", self.model())
+        with self.assertRaises(ValidationError):
+            self.manager.resume_model("example", "test-model", "workspace")
+        self.assertIsNotNone(self.db.get_paused_model("workspace", "example", "test-model"))
+
+    def test_delete_provider_clears_current_scope_paused_models(self):
+        self.manager.add_provider("example", self.provider())
+        self.manager.add_model("example", self.model())
+        self.manager.pause_model("example", "test-model", "workspace")
+        self.manager.delete_provider("example", "workspace")
+        self.assertEqual([], self.db.list_paused_models("workspace", "example"))
+
 
 class DatabaseTests(unittest.TestCase):
     def setUp(self):
@@ -153,6 +192,77 @@ class DatabaseTests(unittest.TestCase):
 
     def test_invalid_backup_timestamp_is_preserved(self):
         self.assertEqual("not-a-timestamp", format_backup_time_local("not-a-timestamp"))
+
+    def test_backups_keep_only_the_latest_ten_records(self):
+        for index in range(12):
+            self.database.create_backup('{"backup": %d}' % index)
+
+        backups = self.database.list_backups()
+        self.assertEqual(10, len(backups))
+        self.assertEqual('{"backup": 11}', self.database.get_backup(backups[0][0]))
+        self.assertEqual('{"backup": 2}', self.database.get_backup(backups[-1][0]))
+
+    def test_delete_all_backups(self):
+        for index in range(3):
+            self.database.create_backup('{"backup": %d}' % index)
+
+        self.assertEqual(3, self.database.delete_all_backups())
+        self.assertEqual([], self.database.list_backups())
+        self.assertEqual(0, self.database.delete_all_backups())
+
+    def test_paused_models_are_scope_isolated_and_copyable(self):
+        self.database.save_paused_model("first", "provider", "model", '{"id": "model"}')
+        self.database.save_paused_model("second", "provider", "model", '{"id": "replacement"}')
+        self.assertEqual('{"id": "model"}', self.database.get_paused_model("first", "provider", "model"))
+        self.assertEqual('{"id": "replacement"}', self.database.get_paused_model("second", "provider", "model"))
+
+        self.database.copy_paused_models("first", "profile")
+        self.assertEqual('{"id": "model"}', self.database.get_paused_model("profile", "provider", "model"))
+        self.assertTrue(self.database.delete_paused_model("profile", "provider", "model"))
+        self.assertIsNone(self.database.get_paused_model("profile", "provider", "model"))
+        self.database.clear_paused_models("first")
+        self.assertEqual([], self.database.list_paused_models("first", "provider"))
+
+
+class ModelListCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 1000.0
+        self.cache = ModelListCache(clock=lambda: self.now)
+
+    def test_returns_cached_models_before_expiry_and_expires_at_three_minutes(self):
+        self.cache.store(("provider", "signature"), ["first", "second"])
+        self.assertEqual(["first", "second"], self.cache.get(("provider", "signature")))
+
+        self.now += 180
+        self.assertIsNone(self.cache.get(("provider", "signature")))
+
+    def test_cached_models_are_copied_and_clear_removes_entries(self):
+        key = ("provider", "signature")
+        original = ["first"]
+        self.cache.store(key, original)
+        original.append("second")
+        cached = self.cache.get(key)
+        cached.append("third")
+        self.assertEqual(["first"], self.cache.get(key))
+        self.cache.clear()
+        self.assertIsNone(self.cache.get(key))
+
+    def test_provider_request_settings_produce_distinct_cache_keys(self):
+        provider = {
+            "baseUrl": "https://api.example.com",
+            "apiKey": "first-key",
+            "headers": {"X-Client": "ppm"},
+        }
+        first_key = provider_model_list_cache_key("example", provider)
+        self.assertEqual(first_key, provider_model_list_cache_key("example", dict(provider)))
+
+        changed_url = dict(provider, baseUrl="https://other.example.com")
+        changed_key = dict(provider, apiKey="second-key")
+        changed_headers = dict(provider, headers={"X-Client": "other"})
+        self.assertNotEqual(first_key, provider_model_list_cache_key("example", changed_url))
+        self.assertNotEqual(first_key, provider_model_list_cache_key("example", changed_key))
+        self.assertNotEqual(first_key, provider_model_list_cache_key("example", changed_headers))
+        self.assertNotEqual(first_key, provider_model_list_cache_key("other", provider))
 
 
 class UtilsTests(unittest.TestCase):

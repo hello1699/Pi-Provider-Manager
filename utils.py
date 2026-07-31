@@ -1,6 +1,8 @@
 """Validation and provider-health-check helpers."""
 
+import hashlib
 import json
+import time
 from urllib.parse import urlparse
 
 import requests
@@ -8,6 +10,43 @@ import requests
 
 class ValidationError(ValueError):
     """Raised when user-supplied configuration is invalid."""
+
+
+class ModelListCache:
+    """Short-lived in-memory cache for successful provider model-list requests."""
+
+    def __init__(self, ttl_seconds=180, clock=None):
+        self.ttl_seconds = ttl_seconds
+        self.clock = clock or time.monotonic
+        self._entries = {}
+
+    def get(self, key):
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        cached_at, model_ids = entry
+        if self.clock() - cached_at >= self.ttl_seconds:
+            del self._entries[key]
+            return None
+        return list(model_ids)
+
+    def store(self, key, model_ids):
+        self._entries[key] = (self.clock(), list(model_ids))
+
+    def clear(self):
+        self._entries.clear()
+
+
+def provider_model_list_cache_key(provider_name, provider):
+    """Return a stable cache key for the settings used by a /models request."""
+    request_settings = {
+        "baseUrl": provider.get("baseUrl", ""),
+        "apiKey": provider.get("apiKey", ""),
+        "headers": provider.get("headers", {}),
+    }
+    serialized = json.dumps(request_settings, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    signature = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return provider_name, signature
 
 
 def parse_json_object(value, field_name):

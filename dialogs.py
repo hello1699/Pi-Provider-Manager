@@ -207,7 +207,7 @@ class ModelDialog(tk.Toplevel):
 class FetchedModelsDialog(tk.Toplevel):
     """Lets users select remotely discovered model IDs before editing their Pi metadata."""
 
-    def __init__(self, parent, model_ids, existing_ids, on_confirm):
+    def __init__(self, parent, model_ids, existing_ids, on_confirm, paused_ids=None):
         super().__init__(parent)
         self.title("获取到的模型列表")
         self.geometry("500x430")
@@ -215,6 +215,7 @@ class FetchedModelsDialog(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
         self.on_confirm = on_confirm
+        paused_ids = paused_ids or set()
         self.available_ids = [model_id for model_id in model_ids if model_id not in existing_ids]
 
         frame = ttk.Frame(self, padding=12)
@@ -231,10 +232,12 @@ class FetchedModelsDialog(tk.Toplevel):
         self.tree.column("status", width=120, anchor="center")
         self.tree.tag_configure("existing", foreground="#777777")
         for index, model_id in enumerate(model_ids):
-            exists = model_id in existing_ids
+            is_paused = model_id in paused_ids
+            exists = model_id in existing_ids and not is_paused
+            status = "已暂停" if is_paused else ("已存在" if exists else "可添加")
             self.tree.insert(
-                "", "end", iid=str(index), values=(model_id, "已存在" if exists else "可添加"),
-                tags=("existing",) if exists else (),
+                "", "end", iid=str(index), values=(model_id, status),
+                tags=("existing",) if status != "可添加" else (),
             )
         self.tree.pack(fill="both", expand=True)
 
@@ -269,8 +272,47 @@ class FetchedModelsDialog(tk.Toplevel):
         self.destroy()
 
 
+class PausedModelsDialog(tk.Toplevel):
+    """Shows paused models for one provider and lets the user restore one."""
+
+    def __init__(self, parent, paused_models, on_resume):
+        super().__init__(parent)
+        self.title("已暂停模型")
+        self.geometry("500x330")
+        self.minsize(400, 250)
+        self.transient(parent)
+        self.grab_set()
+        self.on_resume = on_resume
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(frame, columns=("id", "time"), show="headings", selectmode="browse")
+        self.tree.heading("id", text="模型 ID")
+        self.tree.heading("time", text="暂停时间")
+        self.tree.column("id", width=280, anchor="w")
+        self.tree.column("time", width=180, anchor="w")
+        for model_id, paused_at in paused_models:
+            self.tree.insert("", "end", iid=model_id, values=(model_id, format_backup_time_local(paused_at)))
+        self.tree.pack(fill="both", expand=True)
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="关闭", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="恢复选中模型", command=self._resume).pack(side="right", padx=(0, 8))
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _resume(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("未选择模型", "请先选择一个已暂停模型。", parent=self)
+            return
+        model_id = selected[0]
+        if self.on_resume(model_id):
+            self.tree.delete(model_id)
+            if not self.tree.get_children():
+                self.destroy()
+
+
 class BackupDialog(tk.Toplevel):
-    def __init__(self, parent, backups, on_restore, on_delete):
+    def __init__(self, parent, backups, on_restore, on_delete, on_delete_all):
         super().__init__(parent)
         self.title("配置备份")
         self.geometry("420x300")
@@ -278,6 +320,7 @@ class BackupDialog(tk.Toplevel):
         self.grab_set()
         self.on_restore = on_restore
         self.on_delete = on_delete
+        self.on_delete_all = on_delete_all
         frame = ttk.Frame(self, padding=12)
         frame.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(frame, columns=("time",), show="headings", selectmode="browse")
@@ -291,6 +334,7 @@ class BackupDialog(tk.Toplevel):
         ttk.Button(buttons, text="关闭", command=self.destroy).pack(side="right")
         ttk.Button(buttons, text="恢复选中备份", command=self._restore).pack(side="right", padx=(0, 8))
         ttk.Button(buttons, text="删除选中备份", command=self._delete).pack(side="right", padx=(0, 8))
+        ttk.Button(buttons, text="全部删除", command=self._delete_all).pack(side="left")
 
     def _selected_backup_id(self):
         selected = self.tree.selection()
@@ -314,3 +358,7 @@ class BackupDialog(tk.Toplevel):
             self.tree.delete(str(backup_id))
             if not self.tree.get_children():
                 self.destroy()
+
+    def _delete_all(self):
+        if self.on_delete_all():
+            self.destroy()

@@ -6,7 +6,7 @@
 
 - Provider 新增、编辑、删除：`baseUrl`、`api`、API Key、`headers`、`compat`
 - API Key 默认掩码，并可在详情/编辑框中显示或隐藏
-- 每个 Provider 下的模型新增、编辑、删除：ID、上下文窗口、最大 Token、Reasoning、text/image 输入和可选 Cost
+- 每个 Provider 下的模型新增、编辑、删除、暂停和恢复：ID、上下文窗口、最大 Token、Reasoning、text/image 输入和可选 Cost
 - 从当前 Provider 获取远程模型列表，支持多选；逐个填写 Pi 模型参数后添加
 - 每次配置变更自动写入 `~/.pi/agent/models.json`，并在 SQLite 中备份此前文件内容
 - 保存、切换和删除配置方案（Profile）
@@ -23,6 +23,12 @@
 | Python 虚拟环境 | 项目目录下 `.venv/` |
 
 首次运行时，如 `~/.pi/agent/models.json` 不存在，程序会自动建立包含 `{"providers": {}}` 的空配置。
+
+## 暂停模型
+
+在模型列表选中模型后点击 **暂停模型**，程序会将完整模型定义从当前 `models.json` 移除，因此 Pi 会立即停止使用它；定义本身仍保存在 `~/.pi-provider-manager/ppm.db`。通过 **已暂停模型** 可查看并恢复该 Provider 的模型，恢复时会将原有完整配置（包括 Cost、`thinkingLevelMap` 和其他字段）写回 `models.json`。
+
+暂停状态按当前配置方案隔离：在一个方案暂停模型不会影响其他方案。未保存为方案的当前配置使用独立工作区；导入配置或恢复备份会清空该工作区的暂停状态，确保导入/恢复内容完整生效。
 
 ## 安装与运行
 

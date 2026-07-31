@@ -64,10 +64,31 @@ class Database:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paused_models (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope_name TEXT NOT NULL,
+                    provider_name TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    model_json TEXT NOT NULL,
+                    paused_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(scope_name, provider_name, model_id)
+                )
+                """
+            )
 
     def create_backup(self, config_json):
         with self._connect() as connection:
             connection.execute("INSERT INTO backups (config_json) VALUES (?)", (config_json,))
+            connection.execute(
+                """
+                DELETE FROM backups
+                WHERE id NOT IN (
+                    SELECT id FROM backups ORDER BY id DESC LIMIT 10
+                )
+                """
+            )
 
     def list_backups(self):
         with self._connect() as connection:
@@ -86,6 +107,92 @@ class Database:
         with self._connect() as connection:
             cursor = connection.execute("DELETE FROM backups WHERE id = ?", (backup_id,))
         return cursor.rowcount > 0
+
+    def delete_all_backups(self):
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM backups")
+        return cursor.rowcount
+
+    def save_paused_model(self, scope_name, provider_name, model_id, model_json):
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO paused_models (scope_name, provider_name, model_id, model_json)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(scope_name, provider_name, model_id)
+                DO UPDATE SET model_json = excluded.model_json, paused_at = CURRENT_TIMESTAMP
+                """,
+                (scope_name, provider_name, model_id, model_json),
+            )
+
+    def list_paused_models(self, scope_name, provider_name):
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT model_id, paused_at FROM paused_models
+                WHERE scope_name = ? AND provider_name = ?
+                ORDER BY model_id COLLATE NOCASE
+                """,
+                (scope_name, provider_name),
+            ).fetchall()
+
+    def get_paused_model(self, scope_name, provider_name, model_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT model_json FROM paused_models
+                WHERE scope_name = ? AND provider_name = ? AND model_id = ?
+                """,
+                (scope_name, provider_name, model_id),
+            ).fetchone()
+        return row[0] if row else None
+
+    def list_paused_model_data(self, scope_name):
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT provider_name, model_json FROM paused_models
+                WHERE scope_name = ? ORDER BY id
+                """,
+                (scope_name,),
+            ).fetchall()
+
+    def delete_paused_model(self, scope_name, provider_name, model_id):
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM paused_models
+                WHERE scope_name = ? AND provider_name = ? AND model_id = ?
+                """,
+                (scope_name, provider_name, model_id),
+            )
+        return cursor.rowcount > 0
+
+    def clear_paused_models(self, scope_name, provider_name=None):
+        query = "DELETE FROM paused_models WHERE scope_name = ?"
+        parameters = [scope_name]
+        if provider_name is not None:
+            query += " AND provider_name = ?"
+            parameters.append(provider_name)
+        with self._connect() as connection:
+            connection.execute(query, parameters)
+
+    def copy_paused_models(self, source_scope, target_scope):
+        if source_scope == target_scope:
+            return
+        with self._connect() as connection:
+            connection.execute("DELETE FROM paused_models WHERE scope_name = ?", (target_scope,))
+            connection.execute(
+                """
+                INSERT INTO paused_models (scope_name, provider_name, model_id, model_json, paused_at)
+                SELECT ?, provider_name, model_id, model_json, paused_at
+                FROM paused_models WHERE scope_name = ?
+                """,
+                (target_scope, source_scope),
+            )
+
+    def paused_model_ids(self, scope_name, provider_name):
+        return {model_id for model_id, _paused_at in self.list_paused_models(scope_name, provider_name)}
 
     def save_profile(self, name, config_json, overwrite=False):
         with self._connect() as connection:

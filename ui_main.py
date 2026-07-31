@@ -1,22 +1,33 @@
 """Main Tkinter user interface for Pi Provider Manager."""
 
+import copy
 import json
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from dialogs import BackupDialog, FetchedModelsDialog, ModelDialog, ProviderDialog
-from utils import ValidationError, fetch_provider_models, test_provider_connection
+from dialogs import BackupDialog, FetchedModelsDialog, ModelDialog, PausedModelsDialog, ProviderDialog
+from utils import (
+    ModelListCache,
+    ValidationError,
+    fetch_provider_models,
+    provider_model_list_cache_key,
+    test_provider_connection,
+)
 
 
 class MainWindow:
+    WORKSPACE_SCOPE = "__workspace__"
+
     def __init__(self, root, config_manager, database):
         self.root = root
         self.config_manager = config_manager
         self.database = database
         self.selected_provider = None
+        self.current_scope = self.WORKSPACE_SCOPE
         self.pending_fetched_models = []
         self.pending_fetched_provider = None
+        self.model_list_cache = ModelListCache()
         self.status_var = tk.StringVar(value="已加载配置。")
         self.profile_var = tk.StringVar()
         self._build_ui()
@@ -98,6 +109,9 @@ class MainWindow:
         ttk.Button(buttons, text="添加模型", command=self.add_model).pack(side="left")
         self.fetch_models_button = ttk.Button(buttons, text="获取模型列表", command=self.fetch_models)
         self.fetch_models_button.pack(side="left", padx=5)
+        self.fetch_models_button.bind("<Control-Button-1>", self._force_fetch_models)
+        ttk.Button(buttons, text="暂停模型", command=self.pause_model).pack(side="left")
+        ttk.Button(buttons, text="已暂停模型", command=self.show_paused_models).pack(side="left", padx=5)
         ttk.Button(buttons, text="编辑模型", command=self.edit_model).pack(side="left", padx=5)
         ttk.Button(buttons, text="删除模型", command=self.delete_model).pack(side="left")
 
@@ -121,6 +135,31 @@ class MainWindow:
         ttk.Button(profiles, text="保存为方案", command=self.save_profile).pack(side="left")
         ttk.Button(profiles, text="切换方案", command=self.switch_profile).pack(side="left", padx=5)
         ttk.Button(profiles, text="删除方案", command=self.delete_profile).pack(side="left")
+
+    def _profile_config_with_paused_models(self):
+        config = copy.deepcopy(self.config_manager.config)
+        for provider_name, model_json in self.database.list_paused_model_data(self.current_scope):
+            provider = config.get("providers", {}).get(provider_name)
+            if provider is None:
+                continue
+            try:
+                model = json.loads(model_json)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(model, dict) and not any(
+                item.get("id") == model.get("id") for item in provider.get("models", [])
+            ):
+                provider.setdefault("models", []).append(model)
+        return config
+
+    def _apply_paused_models(self, config, scope_name):
+        for provider_name, provider in config.get("providers", {}).items():
+            paused_ids = self.database.paused_model_ids(scope_name, provider_name)
+            if paused_ids:
+                provider["models"] = [
+                    model for model in provider.get("models", []) if model.get("id") not in paused_ids
+                ]
+        return config
 
     def refresh_all(self, keep_provider=None):
         providers = self.config_manager.config["providers"]
@@ -218,7 +257,11 @@ class MainWindow:
             return
         name = self.selected_provider
         if messagebox.askyesno("确认删除", "删除 Provider “%s”及其全部模型？" % name, parent=self.root):
-            self._handle_action(lambda: self.config_manager.delete_provider(name), "Provider 已删除。")
+            if self._handle_action(
+                lambda: self.config_manager.delete_provider(name, self.current_scope),
+                "Provider 已删除。",
+            ):
+                self.model_list_cache.clear()
 
     def _selected_model(self):
         selected = self.model_tree.selection()
@@ -237,45 +280,78 @@ class MainWindow:
         selected = self.selected_provider
         self._handle_action(lambda: self.config_manager.add_model(selected, model), "模型已添加。", selected)
 
-    def fetch_models(self):
+    def _force_fetch_models(self, _event):
+        self.fetch_models(force=True)
+        return "break"
+
+    def fetch_models(self, force=False):
         if not self._require_provider():
             return
         provider_name = self.selected_provider
-        provider = dict(self._current_provider())
+        provider = copy.deepcopy(self._current_provider())
+        cache_key = provider_model_list_cache_key(provider_name, provider)
+        cached_models = None if force else self.model_list_cache.get(cache_key)
+        if cached_models is not None:
+            self.set_status("已使用 %s 的缓存模型列表。" % provider_name)
+            self._finish_fetch_models(provider_name, cache_key, True, cached_models, from_cache=True)
+            return
         self.fetch_models_button.configure(state="disabled")
         self.set_status("正在获取 %s 的模型列表…" % provider_name)
-        threading.Thread(target=self._run_fetch_models, args=(provider_name, provider), daemon=True).start()
+        threading.Thread(
+            target=self._run_fetch_models,
+            args=(provider_name, provider, cache_key),
+            daemon=True,
+        ).start()
 
-    def _run_fetch_models(self, provider_name, provider):
+    def _run_fetch_models(self, provider_name, provider, cache_key):
         success, result = fetch_provider_models(provider)
-        self.root.after(0, lambda: self._finish_fetch_models(provider_name, success, result))
+        self.root.after(
+            0,
+            lambda: self._finish_fetch_models(provider_name, cache_key, success, result),
+        )
 
-    def _finish_fetch_models(self, provider_name, success, result):
-        self.fetch_models_button.configure(state="normal")
-        if not success:
-            self.set_status(result)
-            messagebox.showerror("获取模型列表失败", "%s\n\n%s" % (provider_name, result), parent=self.root)
-            return
-        if not result:
-            message = "%s 未返回可用模型。" % provider_name
-            self.set_status(message)
-            messagebox.showinfo("获取模型列表", message, parent=self.root)
-            return
+    def _finish_fetch_models(self, provider_name, cache_key, success, result, from_cache=False):
+        if not from_cache:
+            self.fetch_models_button.configure(state="normal")
         provider = self.config_manager.config["providers"].get(provider_name)
         if provider is None:
             message = "Provider “%s”已被删除，无法添加获取到的模型。" % provider_name
             self.set_status(message)
             messagebox.showwarning("Provider 不存在", message, parent=self.root)
             return
-        existing_ids = {model.get("id") for model in provider.get("models", [])}
-        available_count = len([model_id for model_id in result if model_id not in existing_ids])
-        if not available_count:
-            message = "获取到的 %d 个模型均已存在于 %s。" % (len(result), provider_name)
+        if provider_model_list_cache_key(provider_name, provider) != cache_key:
+            message = "Provider 配置已更改，已忽略旧的模型列表。"
+            self.set_status(message)
+            return
+        if not success:
+            self.set_status(result)
+            messagebox.showerror("获取模型列表失败", "%s\n\n%s" % (provider_name, result), parent=self.root)
+            return
+        if not from_cache:
+            self.model_list_cache.store(cache_key, result)
+        if not result:
+            message = "%s 未返回可用模型。" % provider_name
             self.set_status(message)
             messagebox.showinfo("获取模型列表", message, parent=self.root)
             return
-        self.set_status("已获取 %d 个模型，其中 %d 个可添加。" % (len(result), available_count))
-        FetchedModelsDialog(self.root, result, existing_ids, lambda ids: self._begin_fetched_model_batch(provider_name, ids))
+        existing_ids = {model.get("id") for model in provider.get("models", [])}
+        paused_ids = self.database.paused_model_ids(self.current_scope, provider_name)
+        unavailable_ids = existing_ids | paused_ids
+        available_count = len([model_id for model_id in result if model_id not in unavailable_ids])
+        if not available_count:
+            message = "获取到的 %d 个模型均已存在或处于暂停状态。" % len(result)
+            self.set_status(message)
+            messagebox.showinfo("获取模型列表", message, parent=self.root)
+            return
+        source = "缓存" if from_cache else "远程"
+        self.set_status("已从%s获取 %d 个模型，其中 %d 个可添加。" % (source, len(result), available_count))
+        FetchedModelsDialog(
+            self.root,
+            result,
+            unavailable_ids,
+            lambda ids: self._begin_fetched_model_batch(provider_name, ids),
+            paused_ids,
+        )
 
     def _begin_fetched_model_batch(self, provider_name, model_ids):
         self.pending_fetched_provider = provider_name
@@ -356,13 +432,53 @@ class MainWindow:
                 "模型已删除。", self.selected_provider,
             )
 
+    def pause_model(self):
+        if not self._require_provider():
+            return
+        _index, model = self._selected_model()
+        if not model:
+            messagebox.showwarning("未选择模型", "请先选择一个模型。", parent=self.root)
+            return
+        model_id = model.get("id", "")
+        self._handle_action(
+            lambda: self.config_manager.pause_model(self.selected_provider, model_id, self.current_scope),
+            "模型已暂停：%s" % model_id,
+            self.selected_provider,
+        )
+
+    def show_paused_models(self):
+        if not self._require_provider():
+            return
+        try:
+            paused_models = self.database.list_paused_models(self.current_scope, self.selected_provider)
+            if not paused_models:
+                messagebox.showinfo("已暂停模型", "当前 Provider 没有已暂停模型。", parent=self.root)
+                return
+            PausedModelsDialog(self.root, paused_models, self.resume_model)
+        except Exception as error:
+            self.show_error("读取已暂停模型失败", error)
+
+    def resume_model(self, model_id):
+        if not self._require_provider():
+            return False
+        provider_name = self.selected_provider
+        return self._handle_action(
+            lambda: self.config_manager.resume_model(provider_name, model_id, self.current_scope),
+            "模型已恢复：%s" % model_id,
+            provider_name,
+        )
+
     def manual_save(self):
         self._handle_action(self.config_manager.save, "配置已保存并创建备份。", self.selected_provider)
 
     def import_config(self):
         path = filedialog.askopenfilename(parent=self.root, title="导入 Pi 配置", filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")])
-        if path and self._handle_action(lambda: self.config_manager.import_from_file(path), "配置已导入。"):
-            self.selected_provider = None
+        if path:
+            self.current_scope = self.WORKSPACE_SCOPE
+            self.database.clear_paused_models(self.current_scope)
+            if self._handle_action(lambda: self.config_manager.import_from_file(path), "配置已导入。"):
+                self.model_list_cache.clear()
+                self.selected_provider = None
 
     def export_config(self):
         path = filedialog.asksaveasfilename(
@@ -401,13 +517,15 @@ class MainWindow:
         if not name:
             messagebox.showwarning("名称无效", "方案名称不能为空。", parent=self.root)
             return
-        config_json = json.dumps(self.config_manager.config, ensure_ascii=False, indent=2)
+        config_json = json.dumps(self._profile_config_with_paused_models(), ensure_ascii=False, indent=2)
         try:
             if not self.database.save_profile(name, config_json):
                 if not messagebox.askyesno("方案已存在", "方案 “%s” 已存在，是否覆盖？" % name, parent=self.root):
                     return
                 self.database.save_profile(name, config_json, overwrite=True)
             self.refresh_profiles()
+            self.database.copy_paused_models(self.current_scope, name)
+            self.current_scope = name
             self.profile_var.set(name)
             self.set_status("方案已保存：%s" % name)
         except Exception as error:
@@ -424,7 +542,10 @@ class MainWindow:
             data = self.database.get_profile(name)
             if data is None:
                 raise RuntimeError("找不到所选配置方案。")
-            self.config_manager.replace_config(json.loads(data))
+            config = self._apply_paused_models(json.loads(data), name)
+            self.config_manager.replace_config(config)
+            self.model_list_cache.clear()
+            self.current_scope = name
             self.selected_provider = None
             self.refresh_all()
             self.set_status("已切换到方案：%s" % name)
@@ -439,6 +560,8 @@ class MainWindow:
         if messagebox.askyesno("确认删除", "删除方案 “%s”？" % name, parent=self.root):
             try:
                 self.database.delete_profile(name)
+                self.database.clear_paused_models(name)
+                self.current_scope = self.WORKSPACE_SCOPE
                 self.refresh_profiles()
                 self.set_status("方案已删除：%s" % name)
             except Exception as error:
@@ -450,7 +573,13 @@ class MainWindow:
             if not backups:
                 messagebox.showinfo("配置备份", "暂时没有可用备份。", parent=self.root)
                 return
-            BackupDialog(self.root, backups, self.restore_backup, self.delete_backup)
+            BackupDialog(
+                self.root,
+                backups,
+                self.restore_backup,
+                self.delete_backup,
+                self.delete_all_backups,
+            )
         except Exception as error:
             self.show_error("读取备份失败", error)
 
@@ -464,6 +593,21 @@ class MainWindow:
             self.show_error("删除备份失败", error)
             return False
 
+    def delete_all_backups(self):
+        if not messagebox.askyesno(
+            "确认全部删除",
+            "删除全部配置备份？此操作无法撤销。",
+            parent=self.root,
+        ):
+            return False
+        try:
+            self.database.delete_all_backups()
+            self.set_status("全部备份已删除。")
+            return True
+        except Exception as error:
+            self.show_error("删除全部备份失败", error)
+            return False
+
     def restore_backup(self, backup_id):
         if not messagebox.askyesno("确认恢复", "恢复此备份？当前配置会先自动备份。", parent=self.root):
             return
@@ -471,7 +615,10 @@ class MainWindow:
             data = self.database.get_backup(backup_id)
             if data is None:
                 raise RuntimeError("找不到所选备份。")
+            self.current_scope = self.WORKSPACE_SCOPE
+            self.database.clear_paused_models(self.current_scope)
             self.config_manager.replace_config(json.loads(data))
+            self.model_list_cache.clear()
             self.selected_provider = None
             self.refresh_all()
             self.set_status("备份已恢复。")

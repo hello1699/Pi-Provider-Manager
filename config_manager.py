@@ -114,11 +114,13 @@ class ConfigManager:
         provider["models"] = models
         self.save()
 
-    def delete_provider(self, name):
+    def delete_provider(self, name, scope_name=None):
         if name not in self.config["providers"]:
             raise ValidationError("找不到所选 Provider。")
         del self.config["providers"][name]
         self.save()
+        if scope_name is not None:
+            self.database.clear_paused_models(scope_name, name)
 
     def add_model(self, provider_name, model):
         provider = self._get_provider(provider_name)
@@ -157,6 +159,39 @@ class ConfigManager:
                 self.save()
                 return
         raise ValidationError("找不到所选模型。")
+
+    def pause_model(self, provider_name, model_id, scope_name):
+        provider = self._get_provider(provider_name)
+        models = provider.setdefault("models", [])
+        for index, model in enumerate(models):
+            if model.get("id") == model_id:
+                self.database.save_paused_model(
+                    scope_name,
+                    provider_name,
+                    model_id,
+                    self._serialize(model),
+                )
+                del models[index]
+                self.save()
+                return
+        raise ValidationError("找不到所选模型。")
+
+    def resume_model(self, provider_name, model_id, scope_name):
+        provider = self._get_provider(provider_name)
+        if any(model.get("id") == model_id for model in provider.setdefault("models", [])):
+            raise ValidationError("当前 Provider 已有同名活跃模型，无法恢复。")
+        paused_json = self.database.get_paused_model(scope_name, provider_name, model_id)
+        if paused_json is None:
+            raise ValidationError("找不到已暂停的模型。")
+        try:
+            model = json.loads(paused_json)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("已暂停模型的数据无效：%s" % error) from error
+        if not isinstance(model, dict) or model.get("id") != model_id:
+            raise RuntimeError("已暂停模型的数据无效。")
+        provider["models"].append(model)
+        self.save()
+        self.database.delete_paused_model(scope_name, provider_name, model_id)
 
     def _get_provider(self, name):
         try:
